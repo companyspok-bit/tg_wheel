@@ -1,18 +1,13 @@
 # main.py — «Колесо финансового баланса»
-# PTB 13.15, режим POLLING, без картинок. Кнопки 0–5 + персональный финал и чек-лист.
+# PTB 13.15, режим POLLING. Кнопки 0–5, персональный финал и чек-лист.
 
 import logging
 import os
 from typing import List
-
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
-    Updater,
-    CommandHandler,
-    MessageHandler,
-    Filters,
-    ConversationHandler,
-    CallbackContext,
+    Updater, CommandHandler, MessageHandler, Filters,
+    ConversationHandler, CallbackContext,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -32,20 +27,12 @@ QUESTIONS = [
 ]
 
 SHORT_TITLES = [
-    "Среднеср. цели",
-    "Пенсия",
-    "Подушка",
-    "Короткие цели",
-    "Мелкие резервы",
-    "Долги",
-    "Lifestyle",
-    "Уверенность",
+    "Среднеср. цели","Пенсия","Подушка","Короткие цели",
+    "Мелкие резервы","Долги","Lifestyle","Уверенность",
 ]
 
-KEYBOARD = ReplyKeyboardMarkup([["0", "1", "2", "3", "4", "5"]],
+KEYBOARD = ReplyKeyboardMarkup([["0","1","2","3","4","5"]],
                                resize_keyboard=True, one_time_keyboard=True)
-
-# -------- Персональные тексты --------
 
 def interpret_average(avg: float) -> str:
     if avg < 1.5: return "Критическое состояние"
@@ -75,9 +62,9 @@ def band_message(avg: float) -> str:
 def gentle_hints(answers: List[int]) -> List[str]:
     hints = []
     if answers[2] <= 2: hints.append("Подушка: цель 1–2 ежемес. дохода, переводи фиксированный % после зарплаты.")
-    if answers[1] <= 2: hints.append("Пенсия: автоплатёж 3–5% на долгий счёт/ИИС — работает сила сложного процента.")
+    if answers[1] <= 2: hints.append("Пенсия: автоплатёж 3–5% на долгий счёт/ИИС — работает сложный процент.")
     if answers[5] <= 2: hints.append("Долги: реестр + стратегия «снежный ком»/«лавина», фиксируй ежемесячный платёж.")
-    if answers[4] <= 2: hints.append("Мелкие резервы: отдельный «карман» для непредвиденных мелочей снижает стресс.")
+    if answers[4] <= 2: hints.append("Мелкие резервы: отдельный «карман» для мелочей снижает стресс.")
     if answers[6] <= 2: hints.append("Lifestyle: запланируй маленькие радости в рамках бюджета — держать курс легче.")
     if answers[0] <= 2 or answers[3] <= 2: hints.append("Цели: разбей на 3–6–12 мес. и поставь автопереводы под каждую.")
     return hints
@@ -88,8 +75,6 @@ def build_personal_message(avg: float, answers: List[int]) -> str:
     if tips:
         msg += "\n\nЧто поможет прямо сейчас:\n• " + "\n• ".join(tips[:3])
     return msg
-
-# -------- Чек-лист (короткий) --------
 
 CHECKLIST_MAP = {
     "Подушка": [
@@ -144,8 +129,6 @@ def build_checklist(answers: List[int]) -> List[str]:
     items.append("— Поставь автопереводы/напоминания, чтобы держать ритм.")
     return items[:4]
 
-# -------- Диалог --------
-
 def start(update: Update, context: CallbackContext):
     context.user_data["answers"] = []
     context.user_data["q_idx"] = 0
@@ -192,7 +175,6 @@ def handle_rating(update: Update, context: CallbackContext):
         update.message.reply_text(QUESTIONS[q_idx], reply_markup=KEYBOARD)
         return GET_RATING
 
-    # финал
     answers = context.user_data["answers"]
     avg = sum(answers) / len(answers)
     weakest_indices = sorted(range(len(answers)), key=lambda i: answers[i])[:3]
@@ -211,7 +193,6 @@ def handle_rating(update: Update, context: CallbackContext):
         f"Чтобы пройти заново — /start",
         reply_markup=ReplyKeyboardRemove(),
     )
-
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -219,7 +200,6 @@ def main():
     token = os.environ.get("TG_BOT_TOKEN")
     if not token:
         raise RuntimeError("Не задан TG_BOT_TOKEN в переменных окружения.")
-
     updater = Updater(token=token, use_context=True)
     dp = updater.dispatcher
 
@@ -233,7 +213,7 @@ def main():
     dp.add_handler(CommandHandler("help", help_cmd))
     dp.add_handler(CommandHandler("cancel", cancel))
 
-    # Только POLLING — чтобы исключить конфликты с вебхуком
+    # Только POLLING (без вебхуков)
     updater.start_polling()
     updater.idle()
 
