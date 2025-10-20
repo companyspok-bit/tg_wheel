@@ -1,5 +1,6 @@
 # main.py — Telegram-бот «Колесо финансового баланса»
-# PTB 13.15, режим polling, PNG-колесо + персональный чеклист
+# PTB 13.15, Webhook на Render (авто-детект) + fallback на polling
+# Отправляет PNG-«колесо» и персональный чек-лист
 
 import logging
 import os
@@ -8,7 +9,7 @@ from typing import List
 
 # Графика
 import matplotlib
-matplotlib.use("Agg")  # без GUI, для сервера
+matplotlib.use("Agg")  # без GUI (для сервера)
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -39,14 +40,8 @@ QUESTIONS = [
 ]
 
 SHORT_TITLES = [
-    "Среднеср. цели",
-    "Пенсия",
-    "Подушка",
-    "Короткие цели",
-    "Мелкие резервы",
-    "Долги",
-    "Lifestyle",
-    "Уверенность",
+    "Среднеср. цели", "Пенсия", "Подушка", "Короткие цели",
+    "Мелкие резервы", "Долги", "Lifestyle", "Уверенность",
 ]
 
 RECOMMENDATIONS = {
@@ -65,14 +60,10 @@ KEYBOARD = ReplyKeyboardMarkup([["0", "1", "2", "3", "4", "5"]],
 # -------- Персональные тексты --------
 
 def interpret_average(avg: float) -> str:
-    if avg < 1.5:
-        return "Критическое состояние"
-    if avg < 2.5:
-        return "Нижний уровень"
-    if avg < 3.5:
-        return "Средний уровень"
-    if avg < 4.5:
-        return "Хороший уровень"
+    if avg < 1.5: return "Критическое состояние"
+    if avg < 2.5: return "Нижний уровень"
+    if avg < 3.5: return "Средний уровень"
+    if avg < 4.5: return "Хороший уровень"
     return "Отличный уровень"
 
 def band_message(avg: float) -> str:
@@ -95,18 +86,12 @@ def band_message(avg: float) -> str:
 
 def gentle_hints(answers: List[int]) -> List[str]:
     hints = []
-    if answers[2] <= 2:  # Подушка
-        hints.append("Подушка: цель 1–2 ежемес. дохода, переводи фиксированный % после зарплаты.")
-    if answers[1] <= 2:  # Пенсия
-        hints.append("Пенсия: автоплатёж 3–5% на долгий счёт/ИИС — эффект накопления сильный.")
-    if answers[5] <= 2:  # Долги
-        hints.append("Долги: реестр + стратегия «снежный ком»/«лавина», фиксируй ежемесячный платёж.")
-    if answers[4] <= 2:  # Мелкие резервы
-        hints.append("Мелкие резервы: отдельный «карман» для мелочей снижает стресс.")
-    if answers[6] <= 2:  # Lifestyle
-        hints.append("Lifestyle: запланируй маленькие радости в рамках бюджета — удерживать курс легче.")
-    if answers[0] <= 2 or answers[3] <= 2:  # Цели
-        hints.append("Цели: разбей на 3–6–12 мес. и поставь автопереводы на каждую.")
+    if answers[2] <= 2: hints.append("Подушка: цель 1–2 ежемес. дохода, переводи фиксированный % после зарплаты.")
+    if answers[1] <= 2: hints.append("Пенсия: автоплатёж 3–5% на долгий счёт/ИИС — эффект накопления сильный.")
+    if answers[5] <= 2: hints.append("Долги: реестр + стратегия «снежный ком»/«лавина», фиксируй ежемес. платёж.")
+    if answers[4] <= 2: hints.append("Мелкие резервы: отдельный «карман» для мелочей снижает стресс.")
+    if answers[6] <= 2: hints.append("Lifestyle: запланируй маленькие радости в рамках бюджета — держать курс легче.")
+    if answers[0] <= 2 or answers[3] <= 2: hints.append("Цели: разбей на 3–6–12 мес. и поставь автопереводы на каждую.")
     return hints
 
 def build_personal_message(avg: float, answers: List[int]) -> str:
@@ -116,61 +101,58 @@ def build_personal_message(avg: float, answers: List[int]) -> str:
         msg += "\n\nЧто поможет прямо сейчас:\n• " + "\n• ".join(tips[:3])
     return msg
 
-# -------- Чек-лист (3 шага по слабым зонам) --------
+# -------- Чек-лист (коротко, по слабым зонам) --------
 
 CHECKLIST_MAP = {
     "Подушка": [
         "Открой отдельный счёт для подушки.",
         "Поставь автоперевод 5–10% после зарплаты.",
-        "Цель: 1–2 ежемес. дохода — отметь дату достижения.",
+        "Цель: 1–2 ежемес. дохода, отметь дедлайн.",
     ],
     "Пенсия": [
-        "Выбери долгосрочный счёт/ИИС для пенсии.",
+        "Выбери долгосрочный счёт/ИИС.",
         "Настрой автоплатёж 3–5% от дохода.",
         "Раз в квартал проверяй распределение активов.",
     ],
     "Долги": [
-        "Составь список долгов (ставка/сумма/минимум).",
-        "Выбери стратегию: «снежный ком» или «лавина».",
+        "Составь реестр долгов (ставка/сумма/минимум).",
+        "Выбери «снежный ком» или «лавина».",
         "Зафиксируй ежемесячный платёж в календаре.",
     ],
     "Мелкие резервы": [
-        "Создай «карман» для мелких непредвиденных трат.",
-        "Определи месячный лимит и пополняй в начале месяца.",
+        "Создай «карман» для мелких непредвиденных.",
+        "Определи месячный лимит, пополняй в начале месяца.",
         "Раз в неделю сверяй остаток.",
     ],
     "Lifestyle": [
         "Запланируй 1–2 радости в рамках бюджета.",
         "Выдели для них фиксированный лимит.",
-        "Отслеживай, что действительно радует — убери лишнее.",
+        "Убери то, что не радует реально.",
     ],
     "Среднеср. цели": [
-        "Определи 1–2 цели на 6–18 месяцев.",
-        "Поставь автоплатёж под каждую цель.",
-        "Раз в месяц сверяй прогресс (дата в календаре).",
+        "Определи 1–2 цели на 6–18 мес.",
+        "Поставь автоплатёж под каждую.",
+        "Раз в месяц сверяй прогресс.",
     ],
     "Короткие цели": [
-        "Сформулируй 1 цель до 3–6 месяцев.",
-        "Разбей на 3–4 шага и поставь дедлайны.",
+        "Сформулируй цель на 3–6 мес.",
+        "Разбей на 3–4 шага с датами.",
         "Отмечай выполнение еженедельно.",
     ],
     "Уверенность": [
-        "Определи, что даст больше уверенности (подушка/план/страховка).",
-        "Сделай 1 маленький шаг уже сегодня.",
-        "Запланируй повторную самопроверку через 30 дней.",
+        "Определи, что сильнее даст уверенность (подушка/план/страховка).",
+        "Сделай один маленький шаг сегодня.",
+        "Назначь повторную самопроверку через 30 дней.",
     ],
 }
 
 def build_checklist(answers: List[int]) -> List[str]:
-    # Берём 2–3 самых слабых направления
     order = np.argsort(answers)[:3]
     items = []
     for idx in order:
         title = SHORT_TITLES[idx]
-        block = CHECKLIST_MAP.get(title, [])[:1]  # хотя бы 1 действие
-        # дадим по 1–2 пункта на направление (не перегружаем)
-        items.append(f"— {title}: {block[0] if block else 'Сделай 1 маленький шаг по этой сфере.'}")
-    # добавим универсальный пункт
+        first = CHECKLIST_MAP.get(title, ["Сделай 1 маленький шаг по этой сфере."])[0]
+        items.append(f"— {title}: {first}")
     items.append("— Поставь автопереводы/напоминания, чтобы держать ритм.")
     return items[:4]
 
@@ -219,7 +201,7 @@ def help_cmd(update: Update, context: CallbackContext):
         "Как это работает:\n"
         "• 8 вопросов\n"
         "• Отвечай числами 0–5 (кнопки ниже)\n"
-        "• В финале — средняя оценка, колесо, чек-лист\n\n"
+        "• В финале — средняя оценка, колесо и чек-лист\n\n"
         "Команды:\n/start — начать заново\n/cancel — отменить\n/help — помощь"
     )
 
@@ -260,23 +242,25 @@ def handle_rating(update: Update, context: CallbackContext):
     personal = build_personal_message(avg, answers)
     checklist = build_checklist(answers)
 
-    # отправляем колесо
+    # колесо
     img = render_wheel(answers)
     update.message.reply_photo(photo=img, caption="Твоё колесо финансового баланса")
 
-    # текстовый результат
+    # текст
     update.message.reply_text(
         f"Средняя оценка: {avg:.2f} / 5\n"
         f"Интерпретация: {interpret_average(avg)}\n\n"
         f"Три самые слабые зоны:\n{weakest}\n\n"
         f"{personal}\n\n"
-        f"Чек-лист на ближайшую неделю:\n" + "\n".join(checklist) + "\n\n"
+        f"Чек-лист на неделю:\n" + "\n".join(checklist) + "\n\n"
         f"Чтобы пройти заново — /start",
         reply_markup=ReplyKeyboardRemove(),
     )
 
     context.user_data.clear()
     return ConversationHandler.END
+
+# -------- Запуск: Webhook на Render + fallback на polling --------
 
 def main():
     token = os.environ.get("TG_BOT_TOKEN")
@@ -292,12 +276,23 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
-
     dp.add_handler(conv)
     dp.add_handler(CommandHandler("help", help_cmd))
     dp.add_handler(CommandHandler("cancel", cancel))
 
-    updater.start_polling()
+    public_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if public_url:
+        # Render Web Service: включаем вебхук и не запускаем polling
+        port = int(os.environ.get("PORT", "10000"))
+        logging.info(f"Starting WEBHOOK on {public_url} (port {port})")
+        updater.start_webhook(listen="0.0.0.0", port=port, url_path=token)
+        # Ставим вебхук на уникальный URL вида https://...onrender.com/<TOKEN>
+        updater.bot.set_webhook(f"{public_url.rstrip('/')}/{token}")
+    else:
+        # Локально / при отсутствии внешнего URL — polling
+        logging.info("RENDER_EXTERNAL_URL not found — starting POLLING")
+        updater.start_polling()
+
     updater.idle()
 
 if __name__ == "__main__":
