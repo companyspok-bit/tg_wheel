@@ -1,17 +1,9 @@
-# main.py — Telegram-бот «Колесо финансового баланса»
-# PTB 13.15, Webhook на Render (авто-детект) + fallback на polling
-# Отправляет PNG-«колесо» и персональный чек-лист
+# main.py — «Колесо финансового баланса»
+# PTB 13.15, режим POLLING, без картинок. Кнопки 0–5 + персональный финал и чек-лист.
 
 import logging
 import os
-from io import BytesIO
 from typing import List
-
-# Графика
-import matplotlib
-matplotlib.use("Agg")  # без GUI (для сервера)
-import matplotlib.pyplot as plt
-import numpy as np
 
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
@@ -40,19 +32,15 @@ QUESTIONS = [
 ]
 
 SHORT_TITLES = [
-    "Среднеср. цели", "Пенсия", "Подушка", "Короткие цели",
-    "Мелкие резервы", "Долги", "Lifestyle", "Уверенность",
+    "Среднеср. цели",
+    "Пенсия",
+    "Подушка",
+    "Короткие цели",
+    "Мелкие резервы",
+    "Долги",
+    "Lifestyle",
+    "Уверенность",
 ]
-
-RECOMMENDATIONS = {
-    "default": "Сфокусируйся на распределении бюджета, резервах и снижении долгов.",
-    0: "Критично: начни с минимальной подушки (1–2 зарплаты) и базового учёта расходов.",
-    1: "Очень низко: определи приоритеты и поищи 1–2 быстрых источника экономии/дохода.",
-    2: "Ниже среднего: поставь автоперевод 3–5% на резерв — важна регулярность.",
-    3: "Средне: база есть — усили резервы и конкретизируй цели.",
-    4: "Хорошо: подумай о диверсификации и защите (страховки/налоги).",
-    5: "Отлично: поддерживай режим и оптимизируй портфель/налоги.",
-}
 
 KEYBOARD = ReplyKeyboardMarkup([["0", "1", "2", "3", "4", "5"]],
                                resize_keyboard=True, one_time_keyboard=True)
@@ -80,18 +68,18 @@ def band_message(avg: float) -> str:
                 "Немного дисциплины — и выйдешь на высокий уровень.")
     if avg < 4.5:
         return ("Отличный фундамент! Подумай о диверсификации и защите: страховки, пенсионный план, "
-                "оптимизация налогов. Это усилит устойчивость и ускорит прогресс.")
+                "оптимизация налогов. Это усилит устойчивость и прогресс.")
     return ("Очень круто! Осталось отполировать детали: тонкая настройка портфеля, "
             "автопополнения и «техосмотр» финансов раз в квартал.")
 
 def gentle_hints(answers: List[int]) -> List[str]:
     hints = []
     if answers[2] <= 2: hints.append("Подушка: цель 1–2 ежемес. дохода, переводи фиксированный % после зарплаты.")
-    if answers[1] <= 2: hints.append("Пенсия: автоплатёж 3–5% на долгий счёт/ИИС — эффект накопления сильный.")
-    if answers[5] <= 2: hints.append("Долги: реестр + стратегия «снежный ком»/«лавина», фиксируй ежемес. платёж.")
-    if answers[4] <= 2: hints.append("Мелкие резервы: отдельный «карман» для мелочей снижает стресс.")
+    if answers[1] <= 2: hints.append("Пенсия: автоплатёж 3–5% на долгий счёт/ИИС — работает сила сложного процента.")
+    if answers[5] <= 2: hints.append("Долги: реестр + стратегия «снежный ком»/«лавина», фиксируй ежемесячный платёж.")
+    if answers[4] <= 2: hints.append("Мелкие резервы: отдельный «карман» для непредвиденных мелочей снижает стресс.")
     if answers[6] <= 2: hints.append("Lifestyle: запланируй маленькие радости в рамках бюджета — держать курс легче.")
-    if answers[0] <= 2 or answers[3] <= 2: hints.append("Цели: разбей на 3–6–12 мес. и поставь автопереводы на каждую.")
+    if answers[0] <= 2 or answers[3] <= 2: hints.append("Цели: разбей на 3–6–12 мес. и поставь автопереводы под каждую.")
     return hints
 
 def build_personal_message(avg: float, answers: List[int]) -> str:
@@ -101,7 +89,7 @@ def build_personal_message(avg: float, answers: List[int]) -> str:
         msg += "\n\nЧто поможет прямо сейчас:\n• " + "\n• ".join(tips[:3])
     return msg
 
-# -------- Чек-лист (коротко, по слабым зонам) --------
+# -------- Чек-лист (короткий) --------
 
 CHECKLIST_MAP = {
     "Подушка": [
@@ -147,43 +135,14 @@ CHECKLIST_MAP = {
 }
 
 def build_checklist(answers: List[int]) -> List[str]:
-    order = np.argsort(answers)[:3]
+    weakest = sorted(range(len(answers)), key=lambda i: answers[i])[:3]
     items = []
-    for idx in order:
+    for idx in weakest:
         title = SHORT_TITLES[idx]
         first = CHECKLIST_MAP.get(title, ["Сделай 1 маленький шаг по этой сфере."])[0]
         items.append(f"— {title}: {first}")
     items.append("— Поставь автопереводы/напоминания, чтобы держать ритм.")
     return items[:4]
-
-# -------- Рисуем «колесо» --------
-
-def render_wheel(answers: List[int]) -> BytesIO:
-    N = len(answers)
-    angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
-    values = answers + [answers[0]]
-    angles += [angles[0]]
-
-    fig = plt.figure(figsize=(5, 5), dpi=150)
-    ax = plt.subplot(111, polar=True)
-    ax.set_theta_offset(np.pi / 2)
-    ax.set_theta_direction(-1)
-
-    ax.set_thetagrids(np.degrees(angles[:-1]), SHORT_TITLES, fontsize=8)
-    ax.set_rgrids([1, 2, 3, 4, 5], angle=90, fontsize=7)
-    ax.set_rlim(0, 5)
-
-    ax.plot(angles, values, linewidth=2)
-    ax.fill(angles, values, alpha=0.25)
-
-    ax.set_title("Колесо финансового баланса", va="bottom", fontsize=11)
-    fig.tight_layout()
-
-    bio = BytesIO()
-    fig.savefig(bio, format="png", bbox_inches="tight")
-    plt.close(fig)
-    bio.seek(0)
-    return bio
 
 # -------- Диалог --------
 
@@ -201,7 +160,7 @@ def help_cmd(update: Update, context: CallbackContext):
         "Как это работает:\n"
         "• 8 вопросов\n"
         "• Отвечай числами 0–5 (кнопки ниже)\n"
-        "• В финале — средняя оценка, колесо и чек-лист\n\n"
+        "• В финале — средняя оценка, слабые зоны, персональный совет и чек-лист\n\n"
         "Команды:\n/start — начать заново\n/cancel — отменить\n/help — помощь"
     )
 
@@ -236,18 +195,14 @@ def handle_rating(update: Update, context: CallbackContext):
     # финал
     answers = context.user_data["answers"]
     avg = sum(answers) / len(answers)
-    weakest_indices = np.argsort(answers)[:3]
+    weakest_indices = sorted(range(len(answers)), key=lambda i: answers[i])[:3]
     weakest = "\n".join([f"- {SHORT_TITLES[i]} → {answers[i]}" for i in weakest_indices])
 
     personal = build_personal_message(avg, answers)
     checklist = build_checklist(answers)
 
-    # колесо
-    img = render_wheel(answers)
-    update.message.reply_photo(photo=img, caption="Твоё колесо финансового баланса")
-
-    # текст
     update.message.reply_text(
+        f"Готово!\n\n"
         f"Средняя оценка: {avg:.2f} / 5\n"
         f"Интерпретация: {interpret_average(avg)}\n\n"
         f"Три самые слабые зоны:\n{weakest}\n\n"
@@ -259,8 +214,6 @@ def handle_rating(update: Update, context: CallbackContext):
 
     context.user_data.clear()
     return ConversationHandler.END
-
-# -------- Запуск: Webhook на Render + fallback на polling --------
 
 def main():
     token = os.environ.get("TG_BOT_TOKEN")
@@ -280,19 +233,8 @@ def main():
     dp.add_handler(CommandHandler("help", help_cmd))
     dp.add_handler(CommandHandler("cancel", cancel))
 
-    public_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if public_url:
-        # Render Web Service: включаем вебхук и не запускаем polling
-        port = int(os.environ.get("PORT", "10000"))
-        logging.info(f"Starting WEBHOOK on {public_url} (port {port})")
-        updater.start_webhook(listen="0.0.0.0", port=port, url_path=token)
-        # Ставим вебхук на уникальный URL вида https://...onrender.com/<TOKEN>
-        updater.bot.set_webhook(f"{public_url.rstrip('/')}/{token}")
-    else:
-        # Локально / при отсутствии внешнего URL — polling
-        logging.info("RENDER_EXTERNAL_URL not found — starting POLLING")
-        updater.start_polling()
-
+    # Только POLLING — чтобы исключить конфликты с вебхуком
+    updater.start_polling()
     updater.idle()
 
 if __name__ == "__main__":
