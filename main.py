@@ -1,342 +1,283 @@
-# -*- coding: utf-8 -*-
-# Telegram-бот «Колесо финансового баланса» — WEBHOOK (Render)
-# deps: python-telegram-bot==13.15, urllib3==1.26.20, six==1.16.0, matplotlib==3.8.4, numpy==2.3.4
+# main.py
+# Python-telegram-bot 13.x
+import os
+import io
+import logging
+from math import pi
+from typing import Dict, List
 
-import os, re, uuid, logging
-from typing import List
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    InputMediaPhoto,
+)
 from telegram.ext import (
-    Updater, CommandHandler, MessageHandler, Filters,
-    ConversationHandler, CallbackContext,
+    Updater,
+    CallbackContext,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    ConversationHandler,
 )
 
-# ----------------- LOGGING -----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("wheel-bot")
-logging.getLogger("telegram").setLevel(logging.INFO)
-logging.getLogger("telegram.ext").setLevel(logging.INFO)
+# ----------------------------- ЛОГИ -----------------------------
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("wheel-bot")
 
-# ----------------- QUIZ -----------------
-GET_RATING = 1
+# ---------------------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ --------------------
+TOKEN = os.environ["TG_BOT_TOKEN"]
 
+# Хост без завершающего слэша, например: https://tg-wheel-2.onrender.com
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "").rstrip("/")
+
+# Если задать 443 — явно добавим его в URL вебхука. Можно оставить пустым.
+FORCE_WEBHOOK_PORT = os.getenv("FORCE_WEBHOOK_PORT", "").strip()
+
+# Render проксирует внешний :443 → внутрь на этот PORT (обычно 10000).
+# В URL вебхука его НИКОГДА не вставляем.
+RAW_PORT = os.getenv("PORT", "10000")
+PORT = int(RAW_PORT) if RAW_PORT else 10000
+
+# Путь вебхука — делаем коротким и «секретным» (по токену)
+WEBHOOK_PATH = f"/{TOKEN}"
+
+if not WEBHOOK_HOST.startswith("http"):
+    raise RuntimeError(
+        "WEBHOOK_HOST не задан или некорректен. Пример: https://tg-wheel-2.onrender.com"
+    )
+
+if FORCE_WEBHOOK_PORT:
+    WEBHOOK_URL = f"{WEBHOOK_HOST}:{FORCE_WEBHOOK_PORT}{WEBHOOK_PATH}"
+else:
+    WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+log.info("Resolved local PORT=%s (raw=%r)", PORT, RAW_PORT)
+log.info("Webhook URL will be set to: %s", WEBHOOK_URL)
+
+# --------------------------- БИЗНЕС-ЛОГИКА -----------------------
 QUESTIONS = [
     "1) Хватает ли на необходимые среднесрочные цели? (0–5)",
-    "2) Заботишься ли о будущей пенсии? (0–5)",
-    "3) Есть ли подушка безопасности? (0–5)",
-    "4) Есть ли небольшие цели (до года)? (0–5)",
-    "5) Есть ли резерв на мелкие расходы? (0–5)",
-    "6) Нет ли долгов (кроме ипотеки)? (0–5)",
-    "7) Хватает ли на lifestyle (удовольствия/образ жизни)? (0–5)",
-    "8) Общая уверенность в своём финансовом состоянии? (0–5)",
+    "2) Есть ли подушка безопасности на 3–6 месяцев расходов? (0–5)",
+    "3) Довольны ли вы учётом доходов/расходов? (0–5)",
+    "4) Устраивает ли уровень долговой нагрузки? (0–5)",
+    "5) Регулярно ли инвестируете по плану? (0–5)",
+    "6) Чувствуете ли уверенность в пенсии/долгосроке? (0–5)",
+    "7) Есть ли страхование ключевых рисков (жизнь/здоровье/имущество)? (0–5)",
+    "8) Насколько финансовые вопросы согласованы в семье/партнёрстве? (0–5)",
 ]
-SHORT_TITLES = [
-    "Среднеср. цели","Пенсия","Подушка","Короткие цели",
-    "Мелкие резервы","Долги","Lifestyle","Уверенность",
-]
-KEYBOARD = ReplyKeyboardMarkup([["0","1","2","3","4","5"]], resize_keyboard=True, one_time_keyboard=True)
+NUM_Q = len(QUESTIONS)
 
-def interpret_average(avg: float) -> str:
-    if avg < 1.5: return "Критическое состояние"
-    if avg < 2.5: return "Нижний уровень"
-    if avg < 3.5: return "Средний уровень"
-    if avg < 4.5: return "Хороший уровень"
-    return "Отличный уровень"
+ASKING, = range(1)
 
-def band_message(avg: float) -> str:
-    if avg < 1.5:
-        return ("Нормальный старт: сфокусируйся на базовых вещах — минимум лишних трат, "
-                "простая таблица учёта и маленькая подушка.")
-    if avg < 2.5:
-        return ("Есть быстрый потенциал роста. Выбери 1–2 шага на неделю "
-                "(например, 5% дохода сразу переводить в резерв).")
-    if avg < 3.5:
-        return ("База уже есть. Добавь структуру: автопереводы на цели и контроль «утечек».")
-    if avg < 4.5:
-        return ("Отличный фундамент! Подумай о диверсификации и защите (страховки/ИИС/налоги).")
-    return ("Очень круто! Дополируй детали: настройка портфеля, автопополнения, "
-            "техосмотр финансов раз в квартал.")
+# Временное хранилище ответов по пользователю
+user_answers: Dict[int, List[int]] = {}
 
-def gentle_hints(ans: List[int]) -> List[str]:
-    tips = []
-    if ans[2] <= 2: tips.append("Подушка: цель 1–2 ежемес. дохода, фиксированный % после зарплаты.")
-    if ans[1] <= 2: tips.append("Пенсия: автоплатёж 3–5% на долгий счёт/ИИС — сила сложного процента.")
-    if ans[5] <= 2: tips.append("Долги: реестр и «снежный ком»/«лавина», фиксируй платёж.")
-    if ans[4] <= 2: tips.append("Мелкие резервы: отдельный «карман» для непредвиденных трат.")
-    if ans[6] <= 2: tips.append("Lifestyle: планируй радости в рамках лимита.")
-    if ans[0] <= 2 or ans[3] <= 2: tips.append("Цели: 3–6–12 мес. с автопереводами.")
-    return tips
 
-def build_personal(avg: float, ans: List[int]) -> str:
-    msg = band_message(avg)
-    tips = gentle_hints(ans)
-    if tips: msg += "\n\nЧто поможет прямо сейчас:\n• " + "\n• ".join(tips[:3])
-    return msg
+def start(update: Update, context: CallbackContext) -> int:
+    user_id = update.effective_user.id
+    user_answers[user_id] = []
 
-CHECKLIST_MAP = {
-    "Подушка": ["Открой отдельный счёт для подушки."],
-    "Пенсия": ["Настрой автоплатёж 3–5% на долгий счёт/ИИС."],
-    "Долги": ["Составь реестр и выбери «снежный ком»/«лавина»."],
-    "Мелкие резервы": ["Создай «карман» для мелких непредвиденных трат."],
-    "Lifestyle": ["Запланируй 1–2 радости в рамках фиксированного лимита."],
-    "Среднеср. цели": ["Определи 1–2 цели на 6–18 мес. и поставь автоплатёж."],
-    "Короткие цели": ["Сформулируй цель на 3–6 мес. и разбей на шаги."],
-    "Уверенность": ["Сделай 1 маленький шаг, который повысит уверенность сегодня."],
-}
-def build_checklist(ans: List[int]) -> List[str]:
-    weakest = sorted(range(len(ans)), key=lambda i: ans[i])[:3]
-    items = [f"— {SHORT_TITLES[i]}: {CHECKLIST_MAP.get(SHORT_TITLES[i], ['Шаг по сфере.'])[0]}" for i in weakest]
-    items.append("— Поставь автопереводы/напоминания — держи ритм.")
-    return items[:4]
-
-# ----------------- DRAW WHEEL -----------------
-def _apply_theme(ax, theme: str):
-    light = (theme != "dark")
-    bg = "#0B0F14" if not light else "#FFFFFF"
-    grid = "#223444" if not light else "#E6E8EB"
-    label = "#E8F1FF" if not light else "#1F2430"
-    ax.figure.set_facecolor(bg)
-    ax.set_facecolor(bg)
-    ax.tick_params(colors=label)
-    ax.yaxis.grid(color=grid)
-    ax.xaxis.grid(color=grid)
-    return bg, grid, label
-
-def make_wheel_images(scores: List[int], titles: List[str], style="radar", theme="light", color="#7C4DFF"):
-    if not re.match(r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$", color or ""):
-        color = "#7C4DFF"
-    sid = uuid.uuid4().hex
-    png_path = f"/tmp/wheel_{sid}.png"
-    pdf_path = f"/tmp/wheel_{sid}.pdf"
-    n = len(scores); data = np.array(scores, dtype=float); maxv = 5.0
-    plt.rcParams.update({"figure.figsize": (6.3, 6.3), "savefig.bbox": "tight", "font.size": 10})
-
-    if style == "donut":
-        theta = np.linspace(0.0, 2*np.pi, n, endpoint=False)
-        width = 2*np.pi / n * 0.9
-        fig, ax = plt.subplots(subplot_kw=dict(polar=True)); _apply_theme(ax, theme)
-        ax.set_theta_offset(np.pi/2); ax.set_theta_direction(-1)
-        base = "#314559" if theme == "dark" else "#F1F3F5"
-        edge = "#1E2B38" if theme == "dark" else "#E6E8EB"
-        ax.bar(theta, [maxv]*n, width=width, bottom=0, color=base, edgecolor=edge, linewidth=1, zorder=1)
-        ax.bar(theta, data, width=width, bottom=0, color=color, alpha=0.86, zorder=2)
-        for ang, lab in zip(theta, titles):
-            ax.text(ang, maxv+0.35, lab, ha="center", va="center",
-                    fontsize=9, color=("#E8F1FF" if theme=="dark" else "#1F2430"))
-        ax.set_rticks([1,2,3,4,5]); ax.set_title("Колесо финансового баланса", pad=16)
-
-    elif style == "rose":
-        theta = np.linspace(0.0, 2*np.pi, n, endpoint=False)
-        width = 2*np.pi / n * 0.9
-        fig, ax = plt.subplots(subplot_kw=dict(polar=True)); _apply_theme(ax, theme)
-        ax.set_theta_offset(np.pi/2); ax.set_theta_direction(-1)
-        base = "#2C3E50" if theme == "dark" else "#EDF2F7"
-        ax.bar(theta, [maxv]*n, width=width, bottom=0, color=base, alpha=0.35, zorder=1)
-        alpha_vals = 0.35 + 0.65 * (data / maxv)
-        for ang, r, a in zip(theta, data, alpha_vals):
-            ax.bar([ang], [r], width=width, bottom=0, color=color, alpha=float(a), zorder=2)
-        for ang, lab in zip(theta, titles):
-            ax.text(ang, maxv+0.35, lab, ha="center", va="center",
-                    fontsize=9, color=("#E8F1FF" if theme=="dark" else "#1F2430"))
-        ax.set_rticks([1,2,3,4,5]); ax.set_title("Колесо финансового баланса", pad=16)
-
-    elif style == "neon":
-        angles = np.linspace(0, 2*np.pi, n, endpoint=False).tolist()
-        data_closed = np.concatenate([data, [data[0]]]); angles_closed = angles + [angles[0]]
-        fig, ax = plt.subplots(subplot_kw=dict(polar=True)); _apply_theme(ax, "dark")
-        ax.set_theta_offset(np.pi/2); ax.set_theta_direction(-1)
-        ax.set_rgrids([1,2,3,4,5], labels=["1","2","3","4","5"], color="#8AF6FF")
-        ax.set_ylim(0, maxv); ax.yaxis.grid(color="#123A4A"); ax.xaxis.grid(color="#123A4A")
-        ax.plot(angles_closed, data_closed, color="#00E5FF", linewidth=2.4)
-        ax.fill(angles_closed, data_closed, color="#00E5FF", alpha=0.18)
-        ax.set_xticks(angles); ax.set_xticklabels(titles, fontsize=9, color="#CDEBFF")
-        ax.set_title("Колесо финансового баланса", pad=16, color="#CDEBFF")
-
-    else:  # radar
-        angles = np.linspace(0, 2*np.pi, n, endpoint=False).tolist()
-        data_closed = np.concatenate([data, [data[0]]]); angles_closed = angles + [angles[0]]
-        fig, ax = plt.subplots(subplot_kw=dict(polar=True)); _apply_theme(ax, theme)
-        ax.set_theta_offset(np.pi/2); ax.set_theta_direction(-1)
-        ax.set_rgrids([1,2,3,4,5], labels=["1","2","3","4","5"])
-        ax.set_ylim(0, maxv)
-        ax.plot(angles_closed, data_closed, color=color, linewidth=2)
-        ax.fill(angles_closed, data_closed, color=color, alpha=0.28)
-        ax.set_xticks(angles); ax.set_xticklabels(titles, fontsize=9,
-            color=("#E8F1FF" if theme=="dark" else "#1F2430"))
-        ax.set_title("Колесо финансового баланса", pad=16)
-
-    fig.savefig(png_path, dpi=180)
-    fig.savefig(pdf_path)
-    plt.close(fig)
-    return png_path, pdf_path
-
-# ----------------- HANDLERS -----------------
-def start(update: Update, context: CallbackContext):
-    context.user_data.clear()
-    context.user_data["answers"] = []
-    context.user_data["q_idx"] = 0
-    context.user_data["style"] = (os.environ.get("WHEEL_STYLE", "radar").strip().lower() or "radar")
-    context.user_data["theme"] = (os.environ.get("WHEEL_THEME", "light").strip().lower() or "light")
-    context.user_data["color"] = (os.environ.get("WHEEL_COLOR", "#7C4DFF").strip() or "#7C4DFF")
+    kb = [["0", "1", "2", "3", "4", "5"]]
     update.message.reply_text(
-        "Привет! За пару минут оценим финансы по 8 сферам. Поехали!\n\n" + QUESTIONS[0],
-        reply_markup=KEYBOARD,
+        "Привет! Я помогу быстро оценить ваши финансы по 8 сферам.\n"
+        "Отвечайте числами 0–5. Поехали!\n\n" + QUESTIONS[0],
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True),
     )
-    return GET_RATING
+    return ASKING
 
-def help_cmd(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "• 8 вопросов (0–5)\n• В конце: резюме + PNG и PDF\n\n"
-        "Команды: /start /style /theme /color /cancel"
-    )
 
-def style_cmd(update: Update, context: CallbackContext):
-    parts = (update.message.text or "").split()
-    if len(parts) == 2 and parts[1].lower() in ("radar","donut","rose","neon"):
-        context.user_data["style"] = parts[1].lower()
-        update.message.reply_text(f"Стиль сохранён: {parts[1].lower()}")
-    else:
-        update.message.reply_text("Используй: /style radar|donut|rose|neon")
-
-def theme_cmd(update: Update, context: CallbackContext):
-    parts = (update.message.text or "").split()
-    if len(parts) == 2 and parts[1].lower() in ("light","dark"):
-        context.user_data["theme"] = parts[1].lower()
-        update.message.reply_text(f"Тема сохранена: {parts[1].lower()}")
-    else:
-        update.message.reply_text("Используй: /theme light|dark")
-
-def color_cmd(update: Update, context: CallbackContext):
-    parts = (update.message.text or "").split()
-    if len(parts) == 2 and parts[1].startswith("#") and len(parts[1]) in (4,7):
-        context.user_data["color"] = parts[1]
-        update.message.reply_text(f"Цвет сохранён: {parts[1]}")
-    else:
-        update.message.reply_text("Пример: /color #7C4DFF")
-
-def cancel(update: Update, context: CallbackContext):
-    update.message.reply_text("Оценка отменена. /start — начать заново.", reply_markup=ReplyKeyboardRemove())
-    context.user_data.clear()
-    return ConversationHandler.END
-
-def handle_rating(update: Update, context: CallbackContext):
+def handle_score(update: Update, context: CallbackContext) -> int:
+    user_id = update.effective_user.id
     text = (update.message.text or "").strip()
-    try:
-        val = int(text)
-        if not 0 <= val <= 5: raise ValueError()
-    except ValueError:
-        update.message.reply_text("Выбери число 0–5 на клавиатуре ниже.", reply_markup=KEYBOARD)
-        return GET_RATING
 
-    context.user_data.setdefault("answers", []).append(val)
-    context.user_data["q_idx"] = q_idx = context.user_data.get("q_idx", 0) + 1
+    # валидируем число
+    if text not in {"0", "1", "2", "3", "4", "5"}:
+        update.message.reply_text("Пожалуйста, введите число от 0 до 5.")
+        return ASKING
 
-    if q_idx < len(QUESTIONS):
-        update.message.reply_text(QUESTIONS[q_idx], reply_markup=KEYBOARD)
-        return GET_RATING
+    score = int(text)
+    user_answers.setdefault(user_id, []).append(score)
+    idx = len(user_answers[user_id])
 
-    answers = context.user_data["answers"]
-    avg = float(sum(answers))/len(answers)
-    weakest_idx = sorted(range(len(answers)), key=lambda i: answers[i])[:3]
-    weakest_txt = "\n".join([f"- {SHORT_TITLES[i]} → {answers[i]}" for i in weakest_idx])
-    personal = band_message(avg)
-    tips = gentle_hints(answers)
-    if tips: personal += "\n\nЧто поможет прямо сейчас:\n• " + "\n• ".join(tips[:3])
-    checklist = build_checklist(answers)
+    if idx < NUM_Q:
+        kb = [["0", "1", "2", "3", "4", "5"]]
+        update.message.reply_text(
+            QUESTIONS[idx],
+            reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True),
+        )
+        return ASKING
 
-    style = context.user_data.get("style","radar")
-    theme = context.user_data.get("theme","light")
-    color = context.user_data.get("color","#7C4DFF")
-    png_path, pdf_path = make_wheel_images(answers, SHORT_TITLES, style=style, theme=theme, color=color)
+    # все ответы есть — считаем и отдаем колесо
+    scores = user_answers[user_id][:NUM_Q]
+    del user_answers[user_id]  # почистим
 
-    update.message.reply_text(
-        f"Готово!\n\nСредняя: {avg:.2f} / 5\n{interpret_average(avg)}\n\n"
-        f"Слабые зоны:\n{weakest_txt}\n\n{personal}\n\n"
-        f"Чек-лист:\n" + "\n".join(checklist) + "\n\n"
-        f"Стиль: {style}, тема: {theme}. Отправляю PNG + PDF.",
+    png_bytes = render_wheel_png(scores)
+    caption = make_summary_text(scores)
+
+    # отправим картинку (и сразу текст)
+    update.message.reply_photo(
+        photo=png_bytes,
+        caption=caption,
         reply_markup=ReplyKeyboardRemove(),
     )
-    try:
-        with open(png_path,"rb") as f:
-            update.message.reply_photo(photo=f, caption="Ваше колесо (PNG)")
-    except Exception as e:
-        logger.exception("send_photo failed: %s", e)
-    try:
-        with open(pdf_path,"rb") as f:
-            update.message.reply_document(document=f, filename="finance_wheel.pdf", caption="Ваше колесо (PDF)")
-    except Exception as e:
-        logger.exception("send_document failed: %s", e)
-    for p in (png_path, pdf_path):
-        try:
-            if os.path.exists(p): os.remove(p)
-        except: pass
-    context.user_data.clear()
+
+    # чек-лист
+    checklist = make_checklist(scores)
+    update.message.reply_text(checklist)
+
+    update.message.reply_text(
+        "Готово! Чтобы пройти ещё раз — /start",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return ConversationHandler.END
 
-# ----------------- MAIN (WEBHOOK) -----------------
-def main():
-    token = os.environ.get("TG_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("Не задан TG_BOT_TOKEN")
 
-    host = (os.environ.get("WEBHOOK_HOST") or "").strip().rstrip("/")
-    if not host.startswith("https://"):
-        raise RuntimeError("WEBHOOK_HOST должен быть в виде https://<service>.onrender.com")
-    # Принудительно 443 в URL (допустимый список Telegram) — лечит редкий кейс с прокси.
-    force_port = os.environ.get("FORCE_WEBHOOK_PORT", "443").strip()
-    if force_port not in ("80","88","443","8443",""):
-        force_port = "443"
+def cancel(update: Update, context: CallbackContext) -> int:
+    user_id = update.effective_user.id
+    user_answers.pop(user_id, None)
+    update.message.reply_text("Окей, остановил. Жду вас в любой момент — /start")
+    return ConversationHandler.END
 
-    path = os.environ.get("WEBHOOK_PATH", f"/{token}")
-    if not path.startswith("/"): path = "/" + path
 
-    raw_port = (os.environ.get("PORT") or "").strip()
-    port = int(raw_port) if raw_port.isdigit() else 10000
-    logger.info("Resolved local PORT=%s (raw=%r)", port, raw_port)
+def make_summary_text(scores: List[int]) -> str:
+    avg = sum(scores) / len(scores)
+    if avg >= 4.5:
+        mood = "Очень мощно! Вы круто управляете деньгами 👏"
+    elif avg >= 3.5:
+        mood = "Хороший уровень. Немного точек роста — и будет топ ✨"
+    elif avg >= 2.5:
+        mood = "Средне: уже есть база, стоит подтянуть слабые места 💪"
+    else:
+        mood = "Есть куда расти — начните с самого низкого сектора 👍"
 
-    updater = Updater(token=token, use_context=True)
+    return (
+        f"Ваши баллы: {', '.join(map(str, scores))}\n"
+        f"Средний балл: {avg:.2f}/5\n\n{mood}"
+    )
+
+
+def make_checklist(scores: List[int]) -> str:
+    items = [
+        "Среднесрочные цели",
+        "Подушка безопасности",
+        "Учёт доходов/расходов",
+        "Долговая нагрузка",
+        "Инвестиции по плану",
+        "Пенсия/долгосрок",
+        "Страхование ключевых рисков",
+        "Согласованность в семье",
+    ]
+    # Сортировка от слабых к сильным
+    order = sorted(range(len(scores)), key=lambda i: scores[i])
+    lines = ["Топ-приоритеты на 30 дней (сначала слабые):"]
+    for i in order[:3]:
+        s = scores[i]
+        label = items[i]
+        lines.append(f"• {label}: сейчас {s}/5 — выберите 1–2 шага для улучшения")
+    return "\n".join(lines)
+
+
+# ------------------- Отрисовка «колеса» (PNG) -------------------
+def render_wheel_png(values: List[int]) -> io.BytesIO:
+    """
+    Отрисовывает «колесо» как радиальную диаграмму (0–5).
+    Возвращает BytesIO (готово для send_photo).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    labels = [
+        "Цели",
+        "Подушка",
+        "Учёт",
+        "Долги",
+        "Инвест.",
+        "Долгосрок",
+        "Страховки",
+        "Семья",
+    ]
+
+    # нормируем в 0..1 для радиальной диаграммы
+    v = np.array(values, dtype=float) / 5.0
+    angles = np.linspace(0, 2 * pi, len(labels), endpoint=False)
+    v = np.concatenate([v, [v[0]]])
+    angles = np.concatenate([angles, [angles[0]]])
+
+    fig = plt.figure(figsize=(6, 6), dpi=160)
+    ax = fig.add_subplot(111, polar=True)
+    ax.set_theta_offset(pi / 2)
+    ax.set_theta_direction(-1)
+
+    ax.set_thetagrids(angles[:-1] * 180/pi, labels, fontsize=10)
+    ax.set_rgrids([0.2, 0.4, 0.6, 0.8, 1.0], labels=["1", "2", "3", "4", "5"], angle=0)
+
+    # Радиальный «полигоник»
+    ax.plot(angles, v, linewidth=2)
+    ax.fill(angles, v, alpha=0.25)
+
+    ax.set_ylim(0, 1.0)
+    ax.grid(True, alpha=0.25)
+
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+# --------------------------- TELEGRAM BOT -----------------------
+def build_conv() -> ConversationHandler:
+    kb = [["0", "1", "2", "3", "4", "5"]]
+    return ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            ASKING: [
+                MessageHandler(Filters.text & ~Filters.command, handle_score)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_user=True,
+        per_chat=True,
+        per_message=False,
+    )
+
+
+def main() -> None:
+    updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={GET_RATING: [MessageHandler(Filters.text & ~Filters.command, handle_rating)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-    dp.add_handler(conv)
-    dp.add_handler(CommandHandler("help", help_cmd))
-    dp.add_handler(CommandHandler("style", style_cmd))
-    dp.add_handler(CommandHandler("theme", theme_cmd))
-    dp.add_handler(CommandHandler("color", color_cmd))
+    # Хендлеры
+    dp.add_handler(build_conv())
     dp.add_handler(CommandHandler("cancel", cancel))
 
+    # Чистим старый вебхук и выставляем новый
     try:
         updater.bot.delete_webhook()
     except Exception as e:
-        logger.warning("delete_webhook failed: %s", e)
+        log.warning("delete_webhook() warning: %s", e)
 
-    logger.info("Starting webhook server on 0.0.0.0:%s url_path=%s", port, path)
-    updater.start_webhook(listen="0.0.0.0", port=port, url_path=path)
+    ok = updater.bot.set_webhook(WEBHOOK_URL, timeout=30)
+    log.info("set_webhook(): %s", ok)
 
-    # Сформируем ИТОГОВЫЙ URL (всегда https, с явным допустимым портом 443/8443/80/88)
-    webhook_url = f"{host}"
-    if force_port:
-        # Если host уже содержит порт — уберём, затем добавим допустимый
-        webhook_url = re.sub(r":\d+$", "", webhook_url)
-        webhook_url = f"{webhook_url}:{force_port}"
-    webhook_url = f"{webhook_url}{path}"
+    # Поднимаем локальный HTTP-сервер на нужном порту (Render сам проксирует 443 → этот порт)
+    updater.start_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=TOKEN,   # должен совпадать с WEBHOOK_PATH
+        # webhook_url не передаём тут, т.к. уже выставили выше через set_webhook()
+    )
+    log.info("Webhook server started on 0.0.0.0:%d path=%s", PORT, WEBHOOK_PATH)
 
-    logger.info("Setting webhook to %s", webhook_url)
-    ok = updater.bot.set_webhook(url=webhook_url, max_connections=40)
-    logger.info("set_webhook(): %s", ok)
-
-    logger.info("Webhook started ✔ (idle)")
+    # Готово
     updater.idle()
+
 
 if __name__ == "__main__":
     main()
