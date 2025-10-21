@@ -1,19 +1,19 @@
 # Telegram-бот «Колесо финансового баланса»
-# Режим: POLLING + генерация PNG и PDF с колесом (matplotlib).
-# Переключение дизайна: /style radar | /style donut (или env WHEEL_STYLE).
+# Режим: POLLING (без вебхуков) + генерация PNG и PDF с колесом (matplotlib)
+# Требования: python-telegram-bot==13.15, urllib3==1.26.20, six==1.16.0, matplotlib==3.8.4, numpy==2.3.4
 
 import logging
 import os
-import uuid
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List
 
-# --- Headless графика ---
+# Headless backend для отрисовки (важно для сервера)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import uuid
 
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
@@ -24,7 +24,7 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# -------- Health-сервер (если деплоите как Web Service; для Koyeb можно оставить/не использовать) --------
+# ---------- Мини health-сервер (не обязателен, но полезен для хостингов с health-check) ----------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = b"ok"
@@ -38,11 +38,14 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
     port = int(os.environ.get("PORT", "8080"))
-    srv = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logging.info(f"Health server on :{port}")
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        srv = HTTPServer(("0.0.0.0", port), HealthHandler)
+        logging.info(f"Health server on :{port}")
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    except Exception as e:
+        logging.warning(f"Health server failed: {e}")
 
-# -------- Опросник --------
+# ---------- Опросник ----------
 GET_RATING = 1
 
 QUESTIONS = [
@@ -115,24 +118,18 @@ CHECKLIST_MAP = {
     "Короткие цели": ["Сформулируй цель на 3–6 мес. и разбей на шаги."],
     "Уверенность": ["Сделай 1 маленький шаг, который повысит уверенность сегодня."],
 }
-
 def build_checklist(ans: List[int]) -> List[str]:
     weakest = sorted(range(len(ans)), key=lambda i: ans[i])[:3]
     items = [f"— {SHORT_TITLES[i]}: {CHECKLIST_MAP.get(SHORT_TITLES[i], ['Шаг по этой сфере.'])[0]}" for i in weakest]
     items.append("— Поставь автопереводы/напоминания — держи ритм.")
     return items[:4]
 
-# -------- Рисуем колесо --------
-def _style_from_context(context: CallbackContext) -> str:
-    # приоритет: /style → env → radar
-    style = context.user_data.get("style")
-    if not style:
-        style = os.environ.get("WHEEL_STYLE", "radar").strip().lower()
-    return "donut" if style == "donut" else "radar"
-
+# ---------- Рисуем колесо ----------
 def make_wheel_images(scores: List[int], titles: List[str], style: str = "radar"):
-    """Возвращает (png_path, pdf_path). Файлы создаются в /tmp."""
-    assert len(scores) == len(titles)
+    """
+    Рисует колесо в стиле 'radar' (по умолчанию) или 'donut' (если передать style='donut').
+    Возвращает (png_path, pdf_path).
+    """
     safe_id = uuid.uuid4().hex
     png_path = f"/tmp/wheel_{safe_id}.png"
     pdf_path = f"/tmp/wheel_{safe_id}.pdf"
@@ -142,62 +139,53 @@ def make_wheel_images(scores: List[int], titles: List[str], style: str = "radar"
     maxv = 5.0
 
     plt.rcParams.update({
-        "figure.figsize": (7, 7),
-        "axes.facecolor": "white",
+        "figure.figsize": (6, 6),      # компактнее
         "savefig.bbox": "tight",
-        "font.size": 11,
+        "font.size": 10,
     })
 
     if style == "donut":
-        # Полярные бары (радиальные сектора)
         theta = np.linspace(0.0, 2*np.pi, n, endpoint=False)
         width = 2*np.pi / n * 0.9
         fig, ax = plt.subplots(subplot_kw=dict(polar=True))
-        ax.set_theta_offset(np.pi / 2)  # выставим «верх» на 12 часов
+        ax.set_theta_offset(np.pi / 2)
         ax.set_theta_direction(-1)
         # фон максимума
         ax.bar(theta, [maxv]*n, width=width, bottom=0, color="#F1F3F5", edgecolor="#E6E8EB", linewidth=1, zorder=1)
-        # наши значения
-        bars = ax.bar(theta, data, width=width, bottom=0, color="#7C4DFF", alpha=0.75, zorder=2)
-        # подписи по окружности
+        # значения
+        ax.bar(theta, data, width=width, bottom=0, color="#7C4DFF", alpha=0.8, zorder=2)
         for ang, lab in zip(theta, titles):
-            ax.text(ang, maxv + 0.35, lab, ha="center", va="center", fontsize=10)
+            ax.text(ang, maxv + 0.3, lab, ha="center", va="center", fontsize=9)
         ax.set_rticks([1,2,3,4,5])
-        ax.set_rlabel_position(0)
         ax.grid(color="#E6E8EB")
-        ax.set_title("Колесо финансового баланса", pad=20)
+        ax.set_title("Колесо финансового баланса", pad=16)
     else:
         # RADAR (паук)
         angles = np.linspace(0, 2*np.pi, n, endpoint=False).tolist()
         data_closed = np.concatenate([data, [data[0]]])
         angles_closed = angles + [angles[0]]
-
         fig, ax = plt.subplots(subplot_kw=dict(polar=True))
         ax.set_theta_offset(np.pi / 2)
         ax.set_theta_direction(-1)
         ax.set_rgrids([1,2,3,4,5], labels=["1","2","3","4","5"])
         ax.set_ylim(0, maxv)
-        # сетка
-        ax.yaxis.grid(color="#E6E8EB")
-        ax.xaxis.grid(color="#E6E8EB")
-        # линия и заливка
+        ax.yaxis.grid(color="#E6E8EB"); ax.xaxis.grid(color="#E6E8EB")
         ax.plot(angles_closed, data_closed, color="#7C4DFF", linewidth=2)
-        ax.fill(angles_closed, data_closed, color="#7C4DFF", alpha=0.25)
-        # подписи осей
-        ax.set_xticks(angles)
-        ax.set_xticklabels(titles, fontsize=10)
-        ax.set_title("Колесо финансового баланса", pad=20)
+        ax.fill(angles_closed, data_closed, color="#7C4DFF", alpha=0.28)
+        ax.set_xticks(angles); ax.set_xticklabels(titles, fontsize=9)
+        ax.set_title("Колесо финансового баланса", pad=16)
 
-    # сохранение
-    fig.savefig(png_path, dpi=200)
-    fig.savefig(pdf_path)  # matplotlib умеет прямо в PDF
+    fig.savefig(png_path, dpi=180)  # PNG
+    fig.savefig(pdf_path)           # PDF
     plt.close(fig)
     return png_path, pdf_path
 
-# -------- Диалог --------
+# ---------- Диалог ----------
 def start(update: Update, context: CallbackContext):
     context.user_data["answers"] = []
     context.user_data["q_idx"] = 0
+    style_env = os.environ.get("WHEEL_STYLE", "radar").strip().lower()
+    context.user_data["style"] = "donut" if style_env == "donut" else "radar"
     update.message.reply_text(
         "Привет! За пару минут оценим твои финансы по 8 сферам. Готов начать?\n\n" + QUESTIONS[0],
         reply_markup=KEYBOARD,
@@ -208,8 +196,8 @@ def help_cmd(update: Update, context: CallbackContext):
     update.message.reply_text(
         "Как это работает:\n"
         "• 8 вопросов (оценка 0–5)\n"
-        "• В конце получишь краткое резюме + PNG и PDF с колесом\n\n"
-        "Команды:\n/start — начать заново\n/style radar|donut — выбрать стиль колеса\n/cancel — отменить\n/help — помощь"
+        "• В конце: резюме + PNG и PDF с колесом\n\n"
+        "Команды:\n/start — начать заново\n/style radar|donut — стиль колеса\n/cancel — отменить"
     )
 
 def style_cmd(update: Update, context: CallbackContext):
@@ -257,11 +245,9 @@ def handle_rating(update: Update, context: CallbackContext):
     personal = build_personal(avg, answers)
     checklist = build_checklist(answers)
 
-    # делаем картинки
-    style = _style_from_context(context)
+    style = context.user_data.get("style", "radar")
     png_path, pdf_path = make_wheel_images(answers, SHORT_TITLES, style=style)
 
-    # текстовый отчёт
     update.message.reply_text(
         f"Готово!\n\n"
         f"Средняя оценка: {avg:.2f} / 5\n"
@@ -273,20 +259,29 @@ def handle_rating(update: Update, context: CallbackContext):
         reply_markup=ReplyKeyboardRemove(),
     )
 
-    # отправляем PNG и PDF
+    # отправка файлов
+    send_errors = []
     try:
         with open(png_path, "rb") as f:
-            update.message.bot.send_photo(update.effective_chat.id, f)
+            update.message.reply_photo(photo=f, caption="Ваше колесо (PNG)")
     except Exception as e:
-        logger.exception("send_photo failed: %s", e)
+        logger.exception("send_photo failed")
+        send_errors.append(f"PNG: {e}")
 
     try:
         with open(pdf_path, "rb") as f:
-            update.message.bot.send_document(update.effective_chat.id, f, filename="finance_wheel.pdf")
+            update.message.reply_document(document=f, filename="finance_wheel.pdf", caption="Ваше колесо (PDF)")
     except Exception as e:
-        logger.exception("send_document failed: %s", e)
+        logger.exception("send_document failed")
+        send_errors.append(f"PDF: {e}")
 
-    # чистим
+    if send_errors:
+        update.message.reply_text(
+            "Не удалось отправить файлы автоматически. " +
+            "\n".join(f"• {err}" for err in send_errors)
+        )
+
+    # очистка tmp
     for p in (png_path, pdf_path):
         try:
             if os.path.exists(p): os.remove(p)
@@ -301,7 +296,7 @@ def main():
     if not token:
         raise RuntimeError("Не задан TG_BOT_TOKEN в переменных окружения.")
 
-    # (опционально) health-сервер — безопасно оставить
+    # Health-сервер (безопасно оставить)
     start_health_server()
 
     updater = Updater(token=token, use_context=True)
