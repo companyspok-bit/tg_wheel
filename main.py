@@ -371,23 +371,31 @@ def handle_rating(update: Update, context: CallbackContext):
 
 # -------------------- WEBHOOK MAIN --------------------
 def main():
+    # 1) Токен из переменных окружения
     token = os.environ.get("TG_BOT_TOKEN")
     if not token:
         raise RuntimeError("Не задан TG_BOT_TOKEN")
 
+    # 2) Внешний URL сервиса (БЕЗ порта!)
     host = os.environ.get("WEBHOOK_HOST")  # например: https://tg-wheel-1.onrender.com
     if not host:
         raise RuntimeError("Не задан WEBHOOK_HOST (например, https://<service>.onrender.com)")
-    path = os.environ.get("WEBHOOK_PATH", f"/{token}")  # безопасный путь, можно оставить по умолчанию
-    raw_port = (os.environ.get("PORT") or "").strip()
-try:
-    port = int(raw_port) if raw_port else 10000
-except Exception:
-    port = 10000         # Render проксирует этот порт на 443
 
-    # Доп. health, если хочется пинговать снаружи что-то ещё: https://<host>:<HEALTH_PORT>/ (необязательно)
+    # 3) Путь вебхука (можно не задавать — по умолчанию безопасно /<token>)
+    path = os.environ.get("WEBHOOK_PATH", f"/{token}")
+
+    # 4) Порт. На Render кастомную переменную PORT НЕ задаём.
+    raw_port = (os.environ.get("PORT") or "").strip()
+    try:
+        port = int(raw_port) if raw_port else 10000
+    except Exception:
+        port = 10000
+    logger.info("Resolved PORT=%s (raw=%r)", port, raw_port)
+
+    # (необяз.) поднимем health-сервер
     start_health_server()
 
+    # --- Telegram: Updater/Dispatcher/Handlers ---
     updater = Updater(token=token, use_context=True)
     dp = updater.dispatcher
 
@@ -404,17 +412,17 @@ except Exception:
     dp.add_handler(CommandHandler("color", color_cmd))
     dp.add_handler(CommandHandler("cancel", cancel))
 
-    # Снимаем старый webhook (на всякий случай)
+    # На всякий снимем старый вебхук
     try:
         updater.bot.delete_webhook()
     except Exception as e:
         logger.warning("delete_webhook failed: %s", e)
 
-    # Стартуем встроенный HTTP-сервер PTB
+    # Локальный HTTP-сервер PTB
     logger.info("Starting webhook server on 0.0.0.0:%s, url_path=%s", port, path)
     updater.start_webhook(listen="0.0.0.0", port=port, url_path=path)
 
-    # Вешаем webhook на внешний HTTPS без нестандартного порта
+    # Устанавливаем вебхук на внешний HTTPS без порта
     webhook_url = f"{host.rstrip('/')}{path}"
     logger.info("Setting webhook to %s", webhook_url)
     ok = updater.bot.set_webhook(url=webhook_url, max_connections=40)
