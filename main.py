@@ -1,20 +1,19 @@
-# Telegram-бот «Колесо финансового баланса»
-# Режим: POLLING (без вебхуков) + генерация PNG и PDF (matplotlib)
-# Требует пакетов: python-telegram-bot==13.15, urllib3==1.26.20, six==1.16.0,
-#                  matplotlib==3.8.4, numpy==2.3.4
+# Telegram-бот «Колесо финансового баланса» — WEBHOOK-режим (Render Web Service)
+# Требует: python-telegram-bot==13.15, urllib3==1.26.20, six==1.16.0, matplotlib==3.8.4, numpy==2.3.4
 
 import logging
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import re
+import uuid
 
 # Headless backend для отрисовки
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import uuid
 
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
@@ -28,7 +27,9 @@ logger = logging.getLogger(__name__)
 logging.getLogger("telegram").setLevel(logging.INFO)
 logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
-# -------------------- Health-сервер (для Render/Koyeb) --------------------
+# -------------------- Health (не обязателен, но полезен для хостинга) --------------------
+# Когда ты работаешь в webhook-режиме, PTB уже поднимает свой веб-сервер.
+# Этот мини health-сервер просто отвечает на /health, если хочется внешний ping.
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = b"ok"
@@ -41,7 +42,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 
 def start_health_server():
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(os.environ.get("HEALTH_PORT", "8081"))
     try:
         srv = HTTPServer(("0.0.0.0", port), HealthHandler)
         logger.info(f"Health server on :{port}")
@@ -62,12 +63,10 @@ QUESTIONS = [
     "7) Хватает ли на lifestyle (удовольствия/образ жизни)? (0–5)",
     "8) Общая уверенность в своём финансовом состоянии? (0–5)",
 ]
-
 SHORT_TITLES = [
     "Среднеср. цели","Пенсия","Подушка","Короткие цели",
     "Мелкие резервы","Долги","Lifestyle","Уверенность",
 ]
-
 KEYBOARD = ReplyKeyboardMarkup([["0","1","2","3","4","5"]],
                                resize_keyboard=True, one_time_keyboard=True)
 
@@ -129,21 +128,42 @@ def build_checklist(ans: List[int]) -> List[str]:
     return items[:4]
 
 # -------------------- Рисуем колесо --------------------
-def make_wheel_images(scores: List[int], titles: List[str], style: str = "radar"):
+def _apply_theme(ax, theme: str):
+    light = (theme != "dark")
+    bg = "#0B0F14" if not light else "#FFFFFF"
+    grid = "#223444" if not light else "#E6E8EB"
+    label = "#E8F1FF" if not light else "#1F2430"
+    ax.figure.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    ax.tick_params(colors=label)
+    try:
+        ax.title.set_color(label)
+    except:
+        pass
+    ax.yaxis.grid(color=grid)
+    ax.xaxis.grid(color=grid)
+    return bg, grid, label
+
+def make_wheel_images(scores: List[int], titles: List[str], style: str = "radar",
+                      theme: str = "light", color: str = "#7C4DFF"):
     """
-    Рисует колесо в стиле 'radar' (по умолчанию) или 'donut'.
-    Возвращает (png_path, pdf_path).
+    Стиль: radar | donut | rose | neon
+    Тема:  light | dark
+    Цвет:  HEX (#RRGGBB или #RGB)
     """
     safe_id = uuid.uuid4().hex
     png_path = f"/tmp/wheel_{safe_id}.png"
     pdf_path = f"/tmp/wheel_{safe_id}.pdf"
+
+    if not re.match(r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$", color or ""):
+        color = "#7C4DFF"
 
     n = len(scores)
     data = np.array(scores, dtype=float)
     maxv = 5.0
 
     plt.rcParams.update({
-        "figure.figsize": (6, 6),
+        "figure.figsize": (6.3, 6.3),
         "savefig.bbox": "tight",
         "font.size": 10,
     })
@@ -152,43 +172,77 @@ def make_wheel_images(scores: List[int], titles: List[str], style: str = "radar"
         theta = np.linspace(0.0, 2*np.pi, n, endpoint=False)
         width = 2*np.pi / n * 0.9
         fig, ax = plt.subplots(subplot_kw=dict(polar=True))
-        ax.set_theta_offset(np.pi / 2)
-        ax.set_theta_direction(-1)
-        # фон
-        ax.bar(theta, [maxv]*n, width=width, bottom=0, color="#F1F3F5",
-               edgecolor="#E6E8EB", linewidth=1, zorder=1)
-        # значения
-        ax.bar(theta, data, width=width, bottom=0, color="#7C4DFF", alpha=0.8, zorder=2)
+        _apply_theme(ax, theme)
+        ax.set_theta_offset(np.pi / 2); ax.set_theta_direction(-1)
+        base = "#314559" if theme == "dark" else "#F1F3F5"
+        edge = "#1E2B38" if theme == "dark" else "#E6E8EB"
+        ax.bar(theta, [maxv]*n, width=width, bottom=0, color=base, edgecolor=edge, linewidth=1, zorder=1)
+        ax.bar(theta, data, width=width, bottom=0, color=color, alpha=0.86, zorder=2)
         for ang, lab in zip(theta, titles):
-            ax.text(ang, maxv + 0.3, lab, ha="center", va="center", fontsize=9)
-        ax.set_rticks([1,2,3,4,5]); ax.grid(color="#E6E8EB")
+            ax.text(ang, maxv + 0.35, lab, ha="center", va="center",
+                    fontsize=9, color=("#E8F1FF" if theme=="dark" else "#1F2430"))
+        ax.set_rticks([1,2,3,4,5]); ax.set_rlabel_position(0)
         ax.set_title("Колесо финансового баланса", pad=16)
-    else:
-        # RADAR
+
+    elif style == "rose":
+        theta = np.linspace(0.0, 2*np.pi, n, endpoint=False)
+        width = 2*np.pi / n * 0.9
+        fig, ax = plt.subplots(subplot_kw=dict(polar=True))
+        _apply_theme(ax, theme)
+        ax.set_theta_offset(np.pi / 2); ax.set_theta_direction(-1)
+        base = "#2C3E50" if theme == "dark" else "#EDF2F7"
+        ax.bar(theta, [maxv]*n, width=width, bottom=0, color=base, alpha=0.35, zorder=1)
+        alpha_vals = 0.35 + 0.65 * (data / maxv)
+        for ang, r, a in zip(theta, data, alpha_vals):
+            ax.bar([ang], [r], width=width, bottom=0, color=color, alpha=float(a), zorder=2)
+        for ang, lab in zip(theta, titles):
+            ax.text(ang, maxv + 0.35, lab, ha="center", va="center",
+                    fontsize=9, color=("#E8F1FF" if theme=="dark" else "#1F2430"))
+        ax.set_rticks([1,2,3,4,5]); ax.set_title("Колесо финансового баланса", pad=16)
+
+    elif style == "neon":
         angles = np.linspace(0, 2*np.pi, n, endpoint=False).tolist()
         data_closed = np.concatenate([data, [data[0]]])
         angles_closed = angles + [angles[0]]
         fig, ax = plt.subplots(subplot_kw=dict(polar=True))
+        _apply_theme(ax, "dark")
+        ax.set_theta_offset(np.pi / 2); ax.set_theta_direction(-1)
+        ax.set_rgrids([1,2,3,4,5], labels=["1","2","3","4","5"], color="#8AF6FF")
+        ax.set_ylim(0, maxv)
+        ax.yaxis.grid(color="#123A4A"); ax.xaxis.grid(color="#123A4A")
+        ax.plot(angles_closed, data_closed, color="#00E5FF", linewidth=2.4)
+        ax.fill(angles_closed, data_closed, color="#00E5FF", alpha=0.18)
+        ax.set_xticks(angles); ax.set_xticklabels(titles, fontsize=9, color="#CDEBFF")
+        ax.set_title("Колесо финансового баланса", pad=16, color="#CDEBFF")
+
+    else:  # radar
+        angles = np.linspace(0, 2*np.pi, n, endpoint=False).tolist()
+        data_closed = np.concatenate([data, [data[0]]])
+        angles_closed = angles + [angles[0]]
+        fig, ax = plt.subplots(subplot_kw=dict(polar=True))
+        _apply_theme(ax, theme)
         ax.set_theta_offset(np.pi / 2); ax.set_theta_direction(-1)
         ax.set_rgrids([1,2,3,4,5], labels=["1","2","3","4","5"])
         ax.set_ylim(0, maxv)
-        ax.yaxis.grid(color="#E6E8EB"); ax.xaxis.grid(color="#E6E8EB")
-        ax.plot(angles_closed, data_closed, color="#7C4DFF", linewidth=2)
-        ax.fill(angles_closed, data_closed, color="#7C4DFF", alpha=0.28)
-        ax.set_xticks(angles); ax.set_xticklabels(titles, fontsize=9)
+        ax.plot(angles_closed, data_closed, color=color, linewidth=2)
+        ax.fill(angles_closed, data_closed, color=color, alpha=0.28)
+        ax.set_xticks(angles); ax.set_xticklabels(titles, fontsize=9,
+            color=("#E8F1FF" if theme=="dark" else "#1F2430"))
         ax.set_title("Колесо финансового баланса", pad=16)
 
-    fig.savefig(png_path, dpi=180)  # PNG
-    fig.savefig(pdf_path)           # PDF
+    fig.savefig(png_path, dpi=180)
+    fig.savefig(pdf_path)
     plt.close(fig)
     return png_path, pdf_path
 
-# -------------------- Диалоговые хендлеры --------------------
+# -------------------- Команды и диалог --------------------
 def start(update: Update, context: CallbackContext):
     context.user_data["answers"] = []
     context.user_data["q_idx"] = 0
     style_env = os.environ.get("WHEEL_STYLE", "radar").strip().lower()
-    context.user_data["style"] = "donut" if style_env == "donut" else "radar"
+    context.user_data["style"] = style_env if style_env in ("radar","donut","rose","neon") else "radar"
+    context.user_data["theme"] = os.environ.get("WHEEL_THEME", "light").strip().lower()
+    context.user_data["color"] = os.environ.get("WHEEL_COLOR", "#7C4DFF").strip()
     update.message.reply_text(
         "Привет! За пару минут оценим твои финансы по 8 сферам. Готов начать?\n\n" + QUESTIONS[0],
         reply_markup=KEYBOARD,
@@ -200,16 +254,37 @@ def help_cmd(update: Update, context: CallbackContext):
         "Как это работает:\n"
         "• 8 вопросов (оценка 0–5)\n"
         "• В конце: резюме + PNG и PDF с колесом\n\n"
-        "Команды:\n/start — начать заново\n/style radar|donut — стиль колеса\n/cancel — отменить"
+        "Команды:\n"
+        "/start — начать заново\n"
+        "/style radar|donut|rose|neon — стиль колеса\n"
+        "/theme light|dark — тема\n"
+        "/color #HEX — цвет\n"
+        "/cancel — отменить"
     )
 
 def style_cmd(update: Update, context: CallbackContext):
     parts = (update.message.text or "").strip().split()
-    if len(parts) == 2 and parts[1].lower() in ("radar", "donut"):
+    if len(parts) == 2 and parts[1].lower() in ("radar", "donut", "rose", "neon"):
         context.user_data["style"] = parts[1].lower()
         update.message.reply_text(f"Стиль сохранён: {parts[1].lower()}. Продолжаем!")
     else:
-        update.message.reply_text("Используй: /style radar или /style donut")
+        update.message.reply_text("Используй: /style radar|donut|rose|neon")
+
+def theme_cmd(update: Update, context: CallbackContext):
+    parts = (update.message.text or "").strip().split()
+    if len(parts) == 2 and parts[1].lower() in ("light", "dark"):
+        context.user_data["theme"] = parts[1].lower()
+        update.message.reply_text(f"Тема сохранена: {parts[1].lower()}.")
+    else:
+        update.message.reply_text("Используй: /theme light или /theme dark")
+
+def color_cmd(update: Update, context: CallbackContext):
+    parts = (update.message.text or "").strip().split()
+    if len(parts) == 2 and parts[1].startswith("#") and len(parts[1]) in (4,7):
+        context.user_data["color"] = parts[1]
+        update.message.reply_text(f"Цвет сохранён: {parts[1]}")
+    else:
+        update.message.reply_text("Используй HEX: /color #7C4DFF")
 
 def cancel(update: Update, context: CallbackContext):
     update.message.reply_text(
@@ -249,7 +324,9 @@ def handle_rating(update: Update, context: CallbackContext):
     checklist = build_checklist(answers)
 
     style = context.user_data.get("style", "radar")
-    png_path, pdf_path = make_wheel_images(answers, SHORT_TITLES, style=style)
+    theme = context.user_data.get("theme", "light")
+    color = context.user_data.get("color", "#7C4DFF")
+    png_path, pdf_path = make_wheel_images(answers, SHORT_TITLES, style=style, theme=theme, color=color)
 
     update.message.reply_text(
         f"Готово!\n\n"
@@ -258,11 +335,10 @@ def handle_rating(update: Update, context: CallbackContext):
         f"Три самые слабые зоны:\n{weakest}\n\n"
         f"{personal}\n\n"
         f"Чек-лист на неделю:\n" + "\n".join(checklist) + "\n\n"
-        f"Стиль колеса: {style}. Сейчас пришлю PNG + PDF.",
+        f"Стиль: {style}, тема: {theme}. Сейчас пришлю PNG + PDF.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
-    # отправка файлов
     send_errors = []
     try:
         with open(png_path, "rb") as f:
@@ -284,7 +360,6 @@ def handle_rating(update: Update, context: CallbackContext):
             "\n".join(f"• {err}" for err in send_errors)
         )
 
-    # очистка tmp
     for p in (png_path, pdf_path):
         try:
             if os.path.exists(p): os.remove(p)
@@ -294,13 +369,19 @@ def handle_rating(update: Update, context: CallbackContext):
     context.user_data.clear()
     return ConversationHandler.END
 
-# -------------------- MAIN --------------------
+# -------------------- WEBHOOK MAIN --------------------
 def main():
     token = os.environ.get("TG_BOT_TOKEN")
     if not token:
-        raise RuntimeError("Не задан TG_BOT_TOKEN в переменных окружения.")
+        raise RuntimeError("Не задан TG_BOT_TOKEN")
 
-    # Health-сервер (полезен для Render как Web Service)
+    host = os.environ.get("WEBHOOK_HOST")  # например: https://tg-wheel-1.onrender.com
+    if not host:
+        raise RuntimeError("Не задан WEBHOOK_HOST (например, https://<service>.onrender.com)")
+    path = os.environ.get("WEBHOOK_PATH", f"/{token}")  # безопасный путь, можно оставить по умолчанию
+    port = int(os.environ.get("PORT", "10000"))         # Render проксирует этот порт на 443
+
+    # Доп. health, если хочется пинговать снаружи что-то ещё: https://<host>:<HEALTH_PORT>/ (необязательно)
     start_health_server()
 
     updater = Updater(token=token, use_context=True)
@@ -315,18 +396,27 @@ def main():
     dp.add_handler(conv)
     dp.add_handler(CommandHandler("help", help_cmd))
     dp.add_handler(CommandHandler("style", style_cmd))
+    dp.add_handler(CommandHandler("theme", theme_cmd))
+    dp.add_handler(CommandHandler("color", color_cmd))
     dp.add_handler(CommandHandler("cancel", cancel))
 
-    # Жёстко снимаем webhook, чтобы polling получал апдейты
+    # Снимаем старый webhook (на всякий случай)
     try:
-        ok = updater.bot.delete_webhook()
-        logger.info("delete_webhook(): %s", ok)
+        updater.bot.delete_webhook()
     except Exception as e:
         logger.warning("delete_webhook failed: %s", e)
 
-    logger.info("Starting polling...")
-    updater.start_polling(drop_pending_updates=True)
-    logger.info("Polling started ✔")
+    # Стартуем встроенный HTTP-сервер PTB
+    logger.info("Starting webhook server on 0.0.0.0:%s, url_path=%s", port, path)
+    updater.start_webhook(listen="0.0.0.0", port=port, url_path=path)
+
+    # Вешаем webhook на внешний HTTPS без нестандартного порта
+    webhook_url = f"{host.rstrip('/')}{path}"
+    logger.info("Setting webhook to %s", webhook_url)
+    ok = updater.bot.set_webhook(url=webhook_url, max_connections=40)
+    logger.info("set_webhook(): %s", ok)
+
+    logger.info("Webhook started ✔  (idle)")
     updater.idle()
 
 if __name__ == "__main__":
