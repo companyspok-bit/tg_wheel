@@ -1,9 +1,20 @@
-# main.py — «Колесо финансового баланса»
-# PTB 13.15, режим POLLING. Кнопки 0–5, персональный финал и чек-лист.
+# Telegram-бот «Колесо финансового баланса»
+# Режим: POLLING + генерация PNG и PDF с колесом (matplotlib).
+# Переключение дизайна: /style radar | /style donut (или env WHEEL_STYLE).
 
 import logging
 import os
+import uuid
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List
+
+# --- Headless графика ---
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Updater, CommandHandler, MessageHandler, Filters,
@@ -13,6 +24,25 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# -------- Health-сервер (если деплоите как Web Service; для Koyeb можно оставить/не использовать) --------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args, **kwargs):
+        return
+
+def start_health_server():
+    port = int(os.environ.get("PORT", "8080"))
+    srv = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logging.info(f"Health server on :{port}")
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+# -------- Опросник --------
 GET_RATING = 1
 
 QUESTIONS = [
@@ -59,76 +89,112 @@ def band_message(avg: float) -> str:
     return ("Очень круто! Осталось отполировать детали: тонкая настройка портфеля, "
             "автопополнения и «техосмотр» финансов раз в квартал.")
 
-def gentle_hints(answers: List[int]) -> List[str]:
+def gentle_hints(ans: List[int]) -> List[str]:
     hints = []
-    if answers[2] <= 2: hints.append("Подушка: цель 1–2 ежемес. дохода, переводи фиксированный % после зарплаты.")
-    if answers[1] <= 2: hints.append("Пенсия: автоплатёж 3–5% на долгий счёт/ИИС — работает сложный процент.")
-    if answers[5] <= 2: hints.append("Долги: реестр + стратегия «снежный ком»/«лавина», фиксируй ежемесячный платёж.")
-    if answers[4] <= 2: hints.append("Мелкие резервы: отдельный «карман» для мелочей снижает стресс.")
-    if answers[6] <= 2: hints.append("Lifestyle: запланируй маленькие радости в рамках бюджета — держать курс легче.")
-    if answers[0] <= 2 or answers[3] <= 2: hints.append("Цели: разбей на 3–6–12 мес. и поставь автопереводы под каждую.")
+    if ans[2] <= 2: hints.append("Подушка: цель 1–2 ежемес. дохода, переводи фиксированный % после зарплаты.")
+    if ans[1] <= 2: hints.append("Пенсия: автоплатёж 3–5% на долгий счёт/ИИС — работает сложный процент.")
+    if ans[5] <= 2: hints.append("Долги: реестр + стратегия «снежный ком»/«лавина», фиксируй ежемесячный платёж.")
+    if ans[4] <= 2: hints.append("Мелкие резервы: отдельный «карман» для мелких непредвиденных трат.")
+    if ans[6] <= 2: hints.append("Lifestyle: запланируй маленькие радости в рамках бюджета — держать курс легче.")
+    if ans[0] <= 2 or ans[3] <= 2: hints.append("Цели: разбей на 3–6–12 мес. и поставь автопереводы под каждую.")
     return hints
 
-def build_personal_message(avg: float, answers: List[int]) -> str:
+def build_personal(avg: float, ans: List[int]) -> str:
     msg = band_message(avg)
-    tips = gentle_hints(answers)
-    if tips:
-        msg += "\n\nЧто поможет прямо сейчас:\n• " + "\n• ".join(tips[:3])
+    tips = gentle_hints(ans)
+    if tips: msg += "\n\nЧто поможет прямо сейчас:\n• " + "\n• ".join(tips[:3])
     return msg
 
 CHECKLIST_MAP = {
-    "Подушка": [
-        "Открой отдельный счёт для подушки.",
-        "Поставь автоперевод 5–10% после зарплаты.",
-        "Цель: 1–2 ежемес. дохода, отметь дедлайн.",
-    ],
-    "Пенсия": [
-        "Выбери долгосрочный счёт/ИИС.",
-        "Настрой автоплатёж 3–5% от дохода.",
-        "Раз в квартал проверяй распределение активов.",
-    ],
-    "Долги": [
-        "Составь реестр долгов (ставка/сумма/минимум).",
-        "Выбери «снежный ком» или «лавина».",
-        "Зафиксируй ежемесячный платёж в календаре.",
-    ],
-    "Мелкие резервы": [
-        "Создай «карман» для мелких непредвиденных.",
-        "Определи месячный лимит, пополняй в начале месяца.",
-        "Раз в неделю сверяй остаток.",
-    ],
-    "Lifestyle": [
-        "Запланируй 1–2 радости в рамках бюджета.",
-        "Выдели для них фиксированный лимит.",
-        "Убери то, что не радует реально.",
-    ],
-    "Среднеср. цели": [
-        "Определи 1–2 цели на 6–18 мес.",
-        "Поставь автоплатёж под каждую.",
-        "Раз в месяц сверяй прогресс.",
-    ],
-    "Короткие цели": [
-        "Сформулируй цель на 3–6 мес.",
-        "Разбей на 3–4 шага с датами.",
-        "Отмечай выполнение еженедельно.",
-    ],
-    "Уверенность": [
-        "Определи, что сильнее даст уверенность (подушка/план/страховка).",
-        "Сделай один маленький шаг сегодня.",
-        "Назначь повторную самопроверку через 30 дней.",
-    ],
+    "Подушка": ["Открой отдельный счёт для подушки."],
+    "Пенсия": ["Настрой автоплатёж 3–5% на долгий счёт/ИИС."],
+    "Долги": ["Составь реестр долгов и выбери «снежный ком»/«лавина»."],
+    "Мелкие резервы": ["Создай «карман» для мелких непредвиденных трат."],
+    "Lifestyle": ["Запланируй 1–2 радости в рамках фиксированного лимита."],
+    "Среднеср. цели": ["Определи 1–2 цели на 6–18 мес. и поставь автоплатёж."],
+    "Короткие цели": ["Сформулируй цель на 3–6 мес. и разбей на шаги."],
+    "Уверенность": ["Сделай 1 маленький шаг, который повысит уверенность сегодня."],
 }
 
-def build_checklist(answers: List[int]) -> List[str]:
-    weakest = sorted(range(len(answers)), key=lambda i: answers[i])[:3]
-    items = []
-    for idx in weakest:
-        title = SHORT_TITLES[idx]
-        first = CHECKLIST_MAP.get(title, ["Сделай 1 маленький шаг по этой сфере."])[0]
-        items.append(f"— {title}: {first}")
-    items.append("— Поставь автопереводы/напоминания, чтобы держать ритм.")
+def build_checklist(ans: List[int]) -> List[str]:
+    weakest = sorted(range(len(ans)), key=lambda i: ans[i])[:3]
+    items = [f"— {SHORT_TITLES[i]}: {CHECKLIST_MAP.get(SHORT_TITLES[i], ['Шаг по этой сфере.'])[0]}" for i in weakest]
+    items.append("— Поставь автопереводы/напоминания — держи ритм.")
     return items[:4]
 
+# -------- Рисуем колесо --------
+def _style_from_context(context: CallbackContext) -> str:
+    # приоритет: /style → env → radar
+    style = context.user_data.get("style")
+    if not style:
+        style = os.environ.get("WHEEL_STYLE", "radar").strip().lower()
+    return "donut" if style == "donut" else "radar"
+
+def make_wheel_images(scores: List[int], titles: List[str], style: str = "radar"):
+    """Возвращает (png_path, pdf_path). Файлы создаются в /tmp."""
+    assert len(scores) == len(titles)
+    safe_id = uuid.uuid4().hex
+    png_path = f"/tmp/wheel_{safe_id}.png"
+    pdf_path = f"/tmp/wheel_{safe_id}.pdf"
+
+    n = len(scores)
+    data = np.array(scores, dtype=float)
+    maxv = 5.0
+
+    plt.rcParams.update({
+        "figure.figsize": (7, 7),
+        "axes.facecolor": "white",
+        "savefig.bbox": "tight",
+        "font.size": 11,
+    })
+
+    if style == "donut":
+        # Полярные бары (радиальные сектора)
+        theta = np.linspace(0.0, 2*np.pi, n, endpoint=False)
+        width = 2*np.pi / n * 0.9
+        fig, ax = plt.subplots(subplot_kw=dict(polar=True))
+        ax.set_theta_offset(np.pi / 2)  # выставим «верх» на 12 часов
+        ax.set_theta_direction(-1)
+        # фон максимума
+        ax.bar(theta, [maxv]*n, width=width, bottom=0, color="#F1F3F5", edgecolor="#E6E8EB", linewidth=1, zorder=1)
+        # наши значения
+        bars = ax.bar(theta, data, width=width, bottom=0, color="#7C4DFF", alpha=0.75, zorder=2)
+        # подписи по окружности
+        for ang, lab in zip(theta, titles):
+            ax.text(ang, maxv + 0.35, lab, ha="center", va="center", fontsize=10)
+        ax.set_rticks([1,2,3,4,5])
+        ax.set_rlabel_position(0)
+        ax.grid(color="#E6E8EB")
+        ax.set_title("Колесо финансового баланса", pad=20)
+    else:
+        # RADAR (паук)
+        angles = np.linspace(0, 2*np.pi, n, endpoint=False).tolist()
+        data_closed = np.concatenate([data, [data[0]]])
+        angles_closed = angles + [angles[0]]
+
+        fig, ax = plt.subplots(subplot_kw=dict(polar=True))
+        ax.set_theta_offset(np.pi / 2)
+        ax.set_theta_direction(-1)
+        ax.set_rgrids([1,2,3,4,5], labels=["1","2","3","4","5"])
+        ax.set_ylim(0, maxv)
+        # сетка
+        ax.yaxis.grid(color="#E6E8EB")
+        ax.xaxis.grid(color="#E6E8EB")
+        # линия и заливка
+        ax.plot(angles_closed, data_closed, color="#7C4DFF", linewidth=2)
+        ax.fill(angles_closed, data_closed, color="#7C4DFF", alpha=0.25)
+        # подписи осей
+        ax.set_xticks(angles)
+        ax.set_xticklabels(titles, fontsize=10)
+        ax.set_title("Колесо финансового баланса", pad=20)
+
+    # сохранение
+    fig.savefig(png_path, dpi=200)
+    fig.savefig(pdf_path)  # matplotlib умеет прямо в PDF
+    plt.close(fig)
+    return png_path, pdf_path
+
+# -------- Диалог --------
 def start(update: Update, context: CallbackContext):
     context.user_data["answers"] = []
     context.user_data["q_idx"] = 0
@@ -141,11 +207,18 @@ def start(update: Update, context: CallbackContext):
 def help_cmd(update: Update, context: CallbackContext):
     update.message.reply_text(
         "Как это работает:\n"
-        "• 8 вопросов\n"
-        "• Отвечай числами 0–5 (кнопки ниже)\n"
-        "• В финале — средняя оценка, слабые зоны, персональный совет и чек-лист\n\n"
-        "Команды:\n/start — начать заново\n/cancel — отменить\n/help — помощь"
+        "• 8 вопросов (оценка 0–5)\n"
+        "• В конце получишь краткое резюме + PNG и PDF с колесом\n\n"
+        "Команды:\n/start — начать заново\n/style radar|donut — выбрать стиль колеса\n/cancel — отменить\n/help — помощь"
     )
+
+def style_cmd(update: Update, context: CallbackContext):
+    parts = (update.message.text or "").strip().split()
+    if len(parts) == 2 and parts[1].lower() in ("radar","donut"):
+        context.user_data["style"] = parts[1].lower()
+        update.message.reply_text(f"Стиль сохранён: {parts[1].lower()}. Продолжаем!")
+    else:
+        update.message.reply_text("Используй: /style radar или /style donut")
 
 def cancel(update: Update, context: CallbackContext):
     update.message.reply_text(
@@ -175,14 +248,20 @@ def handle_rating(update: Update, context: CallbackContext):
         update.message.reply_text(QUESTIONS[q_idx], reply_markup=KEYBOARD)
         return GET_RATING
 
+    # финал
     answers = context.user_data["answers"]
     avg = sum(answers) / len(answers)
     weakest_indices = sorted(range(len(answers)), key=lambda i: answers[i])[:3]
     weakest = "\n".join([f"- {SHORT_TITLES[i]} → {answers[i]}" for i in weakest_indices])
 
-    personal = build_personal_message(avg, answers)
+    personal = build_personal(avg, answers)
     checklist = build_checklist(answers)
 
+    # делаем картинки
+    style = _style_from_context(context)
+    png_path, pdf_path = make_wheel_images(answers, SHORT_TITLES, style=style)
+
+    # текстовый отчёт
     update.message.reply_text(
         f"Готово!\n\n"
         f"Средняя оценка: {avg:.2f} / 5\n"
@@ -190,9 +269,30 @@ def handle_rating(update: Update, context: CallbackContext):
         f"Три самые слабые зоны:\n{weakest}\n\n"
         f"{personal}\n\n"
         f"Чек-лист на неделю:\n" + "\n".join(checklist) + "\n\n"
-        f"Чтобы пройти заново — /start",
+        f"Стиль колеса: {style}. Сейчас пришлю PNG + PDF.",
         reply_markup=ReplyKeyboardRemove(),
     )
+
+    # отправляем PNG и PDF
+    try:
+        with open(png_path, "rb") as f:
+            update.message.bot.send_photo(update.effective_chat.id, f)
+    except Exception as e:
+        logger.exception("send_photo failed: %s", e)
+
+    try:
+        with open(pdf_path, "rb") as f:
+            update.message.bot.send_document(update.effective_chat.id, f, filename="finance_wheel.pdf")
+    except Exception as e:
+        logger.exception("send_document failed: %s", e)
+
+    # чистим
+    for p in (png_path, pdf_path):
+        try:
+            if os.path.exists(p): os.remove(p)
+        except Exception:
+            pass
+
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -200,6 +300,10 @@ def main():
     token = os.environ.get("TG_BOT_TOKEN")
     if not token:
         raise RuntimeError("Не задан TG_BOT_TOKEN в переменных окружения.")
+
+    # (опционально) health-сервер — безопасно оставить
+    start_health_server()
+
     updater = Updater(token=token, use_context=True)
     dp = updater.dispatcher
 
@@ -211,10 +315,10 @@ def main():
     )
     dp.add_handler(conv)
     dp.add_handler(CommandHandler("help", help_cmd))
+    dp.add_handler(CommandHandler("style", style_cmd))
     dp.add_handler(CommandHandler("cancel", cancel))
 
-    # Только POLLING (без вебхуков)
-    updater.start_polling()
+    updater.start_polling(drop_pending_updates=True)
     updater.idle()
 
 if __name__ == "__main__":
