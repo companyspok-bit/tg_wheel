@@ -1,6 +1,7 @@
 # Telegram-бот «Колесо финансового баланса»
-# Режим: POLLING (без вебхуков) + генерация PNG и PDF с колесом (matplotlib)
-# Требования: python-telegram-bot==13.15, urllib3==1.26.20, six==1.16.0, matplotlib==3.8.4, numpy==2.3.4
+# Режим: POLLING (без вебхуков) + генерация PNG и PDF (matplotlib)
+# Требует пакетов: python-telegram-bot==13.15, urllib3==1.26.20, six==1.16.0,
+#                  matplotlib==3.8.4, numpy==2.3.4
 
 import logging
 import os
@@ -8,7 +9,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List
 
-# Headless backend для отрисовки (важно для сервера)
+# Headless backend для отрисовки
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -21,10 +22,13 @@ from telegram.ext import (
     ConversationHandler, CallbackContext,
 )
 
+# -------------------- ЛОГИ --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+logging.getLogger("telegram").setLevel(logging.INFO)
+logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
-# ---------- Мини health-сервер (не обязателен, но полезен для хостингов с health-check) ----------
+# -------------------- Health-сервер (для Render/Koyeb) --------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = b"ok"
@@ -40,12 +44,12 @@ def start_health_server():
     port = int(os.environ.get("PORT", "8080"))
     try:
         srv = HTTPServer(("0.0.0.0", port), HealthHandler)
-        logging.info(f"Health server on :{port}")
+        logger.info(f"Health server on :{port}")
         threading.Thread(target=srv.serve_forever, daemon=True).start()
     except Exception as e:
-        logging.warning(f"Health server failed: {e}")
+        logger.warning(f"Health server failed: {e}")
 
-# ---------- Опросник ----------
+# -------------------- Опросник --------------------
 GET_RATING = 1
 
 QUESTIONS = [
@@ -124,10 +128,10 @@ def build_checklist(ans: List[int]) -> List[str]:
     items.append("— Поставь автопереводы/напоминания — держи ритм.")
     return items[:4]
 
-# ---------- Рисуем колесо ----------
+# -------------------- Рисуем колесо --------------------
 def make_wheel_images(scores: List[int], titles: List[str], style: str = "radar"):
     """
-    Рисует колесо в стиле 'radar' (по умолчанию) или 'donut' (если передать style='donut').
+    Рисует колесо в стиле 'radar' (по умолчанию) или 'donut'.
     Возвращает (png_path, pdf_path).
     """
     safe_id = uuid.uuid4().hex
@@ -139,7 +143,7 @@ def make_wheel_images(scores: List[int], titles: List[str], style: str = "radar"
     maxv = 5.0
 
     plt.rcParams.update({
-        "figure.figsize": (6, 6),      # компактнее
+        "figure.figsize": (6, 6),
         "savefig.bbox": "tight",
         "font.size": 10,
     })
@@ -150,23 +154,22 @@ def make_wheel_images(scores: List[int], titles: List[str], style: str = "radar"
         fig, ax = plt.subplots(subplot_kw=dict(polar=True))
         ax.set_theta_offset(np.pi / 2)
         ax.set_theta_direction(-1)
-        # фон максимума
-        ax.bar(theta, [maxv]*n, width=width, bottom=0, color="#F1F3F5", edgecolor="#E6E8EB", linewidth=1, zorder=1)
+        # фон
+        ax.bar(theta, [maxv]*n, width=width, bottom=0, color="#F1F3F5",
+               edgecolor="#E6E8EB", linewidth=1, zorder=1)
         # значения
         ax.bar(theta, data, width=width, bottom=0, color="#7C4DFF", alpha=0.8, zorder=2)
         for ang, lab in zip(theta, titles):
             ax.text(ang, maxv + 0.3, lab, ha="center", va="center", fontsize=9)
-        ax.set_rticks([1,2,3,4,5])
-        ax.grid(color="#E6E8EB")
+        ax.set_rticks([1,2,3,4,5]); ax.grid(color="#E6E8EB")
         ax.set_title("Колесо финансового баланса", pad=16)
     else:
-        # RADAR (паук)
+        # RADAR
         angles = np.linspace(0, 2*np.pi, n, endpoint=False).tolist()
         data_closed = np.concatenate([data, [data[0]]])
         angles_closed = angles + [angles[0]]
         fig, ax = plt.subplots(subplot_kw=dict(polar=True))
-        ax.set_theta_offset(np.pi / 2)
-        ax.set_theta_direction(-1)
+        ax.set_theta_offset(np.pi / 2); ax.set_theta_direction(-1)
         ax.set_rgrids([1,2,3,4,5], labels=["1","2","3","4","5"])
         ax.set_ylim(0, maxv)
         ax.yaxis.grid(color="#E6E8EB"); ax.xaxis.grid(color="#E6E8EB")
@@ -180,7 +183,7 @@ def make_wheel_images(scores: List[int], titles: List[str], style: str = "radar"
     plt.close(fig)
     return png_path, pdf_path
 
-# ---------- Диалог ----------
+# -------------------- Диалоговые хендлеры --------------------
 def start(update: Update, context: CallbackContext):
     context.user_data["answers"] = []
     context.user_data["q_idx"] = 0
@@ -202,7 +205,7 @@ def help_cmd(update: Update, context: CallbackContext):
 
 def style_cmd(update: Update, context: CallbackContext):
     parts = (update.message.text or "").strip().split()
-    if len(parts) == 2 and parts[1].lower() in ("radar","donut"):
+    if len(parts) == 2 and parts[1].lower() in ("radar", "donut"):
         context.user_data["style"] = parts[1].lower()
         update.message.reply_text(f"Стиль сохранён: {parts[1].lower()}. Продолжаем!")
     else:
@@ -277,7 +280,7 @@ def handle_rating(update: Update, context: CallbackContext):
 
     if send_errors:
         update.message.reply_text(
-            "Не удалось отправить файлы автоматически. " +
+            "Не удалось отправить файлы автоматически.\n" +
             "\n".join(f"• {err}" for err in send_errors)
         )
 
@@ -291,12 +294,13 @@ def handle_rating(update: Update, context: CallbackContext):
     context.user_data.clear()
     return ConversationHandler.END
 
+# -------------------- MAIN --------------------
 def main():
     token = os.environ.get("TG_BOT_TOKEN")
     if not token:
         raise RuntimeError("Не задан TG_BOT_TOKEN в переменных окружения.")
 
-    # Health-сервер (безопасно оставить)
+    # Health-сервер (полезен для Render как Web Service)
     start_health_server()
 
     updater = Updater(token=token, use_context=True)
@@ -313,7 +317,16 @@ def main():
     dp.add_handler(CommandHandler("style", style_cmd))
     dp.add_handler(CommandHandler("cancel", cancel))
 
+    # Жёстко снимаем webhook, чтобы polling получал апдейты
+    try:
+        ok = updater.bot.delete_webhook()
+        logger.info("delete_webhook(): %s", ok)
+    except Exception as e:
+        logger.warning("delete_webhook failed: %s", e)
+
+    logger.info("Starting polling...")
     updater.start_polling(drop_pending_updates=True)
+    logger.info("Polling started ✔")
     updater.idle()
 
 if __name__ == "__main__":
