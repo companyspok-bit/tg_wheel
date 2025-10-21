@@ -379,7 +379,11 @@ def main():
     if not host:
         raise RuntimeError("Не задан WEBHOOK_HOST (например, https://<service>.onrender.com)")
     path = os.environ.get("WEBHOOK_PATH", f"/{token}")  # безопасный путь, можно оставить по умолчанию
-    port = int(os.environ.get("PORT", "10000"))         # Render проксирует этот порт на 443
+    raw_port = (os.environ.get("PORT") or "").strip()
+try:
+    port = int(raw_port) if raw_port else 10000
+except Exception:
+    port = 10000         # Render проксирует этот порт на 443
 
     # Доп. health, если хочется пинговать снаружи что-то ещё: https://<host>:<HEALTH_PORT>/ (необязательно)
     start_health_server()
